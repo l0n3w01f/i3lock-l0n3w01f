@@ -1,0 +1,12 @@
+# Extra options for i3lock-clock, read by contrib/i3lock-wrapper.
+# Copy to ~/.config/i3lock-clock/options and edit. Lines starting with # are
+# ignored; values must not contain spaces.
+#
+# -l idle colour, -o verifying colour, -w wrong password / backspace colour
+-l #e0e0e0
+-o #5fafd7
+-w #d75f5f
+# PNG background, already sized to your screen (i3lock does not scale images)
+#-i /home/you/.config/i3lock-clock/background.png
+# 24-hour clock
+#--24

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Wrapper installed as /usr/local/bin/i3lock so that the system-wide
+# "xss-lock ... -- i3lock --nofork --color 1e1e1e" line picks up the Lixxia
+# fork (installed as i3lock-clock) together with per-user colour options.
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/i3lock-clock/options"
+if [ -r "$conf" ]; then
+    # shellcheck disable=SC2046
+    set -- $(grep -v '^[[:space:]]*#' "$conf") "$@"
+fi
+exec /usr/local/bin/i3lock-clock "$@"
