@@ -27,7 +27,6 @@
 #include <security/pam_appl.h>
 #endif
 #include <getopt.h>
-#include <string.h>
 #include <ev.h>
 #include <sys/mman.h>
 #include <xkbcommon/xkbcommon.h>
@@ -35,7 +34,7 @@
 #include <xkbcommon/xkbcommon-x11.h>
 #include <cairo.h>
 #include <cairo/cairo-xcb.h>
-#ifdef __OpenBSD__
+#ifdef HAVE_EXPLICIT_BZERO
 #include <strings.h> /* explicit_bzero(3) */
 #endif
 #include <xcb/xcb_aux.h>
@@ -58,23 +57,21 @@
 typedef void (*ev_callback_t)(EV_P_ ev_timer *w, int revents);
 static void input_done(void);
 
-/* We need this for libxkbfile */
-
 /* Color options */
-char color[7] = "ffffff"; // background
+char color[7] = "a3a3a3";       // background
 char verifycolor[7] = "00ff00"; // verify
-char wrongcolor[7] = "ff0000"; // wrong
-char idlecolor[7] = "000000"; // idle
+char wrongcolor[7] = "ff0000";  // wrong
+char idlecolor[7] = "000000";   // idle
 
 /* Time format */
 bool use24hour = false;
 
-int inactivity_timeout = 30;
 uint32_t last_resolution[2];
 xcb_window_t win;
 static xcb_cursor_t cursor;
 #ifndef __OpenBSD__
 static pam_handle_t *pam_handle;
+static bool pam_cleanup;
 #endif
 int input_position = 0;
 /* Holds the password you enter (in UTF-8). */
@@ -92,11 +89,12 @@ extern unlock_state_t unlock_state;
 extern auth_state_t auth_state;
 int failed_attempts = 0;
 bool show_failed_attempts = false;
+bool show_keyboard_layout = false;
 bool retry_verification = false;
 
-static struct xkb_state *xkb_state;
+struct xkb_state *xkb_state;
 static struct xkb_context *xkb_context;
-static struct xkb_keymap *xkb_keymap;
+struct xkb_keymap *xkb_keymap;
 static struct xkb_compose_table *xkb_compose_table;
 static struct xkb_compose_state *xkb_compose_state;
 static uint8_t xkb_base_event;
@@ -115,7 +113,7 @@ bool skip_repeated_empty_password = false;
  * Decrements i to point to the previous unicode glyph
  *
  */
-void u8_dec(char *s, int *i) {
+static void u8_dec(char *s, int *i) {
     (void)(isutf(s[--(*i)]) || isutf(s[--(*i)]) || isutf(s[--(*i)]) || --(*i));
 }
 
@@ -123,6 +121,9 @@ void u8_dec(char *s, int *i) {
  * Loads the XKB keymap from the X11 server and feeds it to xkbcommon.
  * Necessary so that we can properly let xkbcommon track the keyboard state and
  * translate keypresses to utf-8.
+ *
+ * This function can be called when the user changes the XKB configuration,
+ * so it must not leave unusable global state behind
  *
  */
 static bool load_keymap(void) {
@@ -133,25 +134,26 @@ static bool load_keymap(void) {
         }
     }
 
-    xkb_keymap_unref(xkb_keymap);
-
     int32_t device_id = xkb_x11_get_core_keyboard_device_id(conn);
     DEBUG("device = %d\n", device_id);
-    if ((xkb_keymap = xkb_x11_keymap_new_from_device(xkb_context, conn, device_id, 0)) == NULL) {
+    struct xkb_keymap *new_keymap = xkb_x11_keymap_new_from_device(xkb_context, conn, device_id, 0);
+    if (new_keymap == NULL) {
         fprintf(stderr, "[i3lock] xkb_x11_keymap_new_from_device failed\n");
         return false;
     }
 
     struct xkb_state *new_state =
-        xkb_x11_state_new_from_device(xkb_keymap, conn, device_id);
+        xkb_x11_state_new_from_device(new_keymap, conn, device_id);
     if (new_state == NULL) {
         fprintf(stderr, "[i3lock] xkb_x11_state_new_from_device failed\n");
         return false;
     }
 
+    /* Only update global state on success */
     xkb_state_unref(xkb_state);
+    xkb_keymap_unref(xkb_keymap);
     xkb_state = new_state;
-
+    xkb_keymap = new_keymap;
     return true;
 }
 
@@ -185,7 +187,7 @@ static bool load_compose_table(const char *locale) {
  *
  */
 static void clear_password_memory(void) {
-#ifdef __OpenBSD__
+#ifdef HAVE_EXPLICIT_BZERO
     /* Use explicit_bzero(3) which was explicitly designed not to be
      * optimized out by the compiler. */
     explicit_bzero(password, strlen(password));
@@ -193,12 +195,13 @@ static void clear_password_memory(void) {
     /* A volatile pointer to the password buffer to prevent the compiler from
      * optimizing this out. */
     volatile char *vpassword = password;
-    for (size_t c = 0; c < sizeof(password); c++)
+    for (size_t c = 0; c < sizeof(password); c++) {
         /* We store a non-random pattern which consists of the (irrelevant)
          * index plus (!) the value of the beep variable. This prevents the
          * compiler from optimizing the calls away, since the value of 'beep'
          * is not known at compile-time. */
         vpassword[c] = c + (int)beep;
+    }
 #endif
 }
 
@@ -210,7 +213,7 @@ ev_timer *start_timer(ev_timer *timer_obj, ev_tstamp timeout, ev_callback_t call
     } else {
         /* When there is no memory, we just don’t have a timeout. We cannot
          * exit() here, since that would effectively unlock the screen. */
-        timer_obj = calloc(sizeof(struct ev_timer), 1);
+        timer_obj = calloc(1, sizeof(struct ev_timer));
         if (timer_obj) {
             ev_timer_init(timer_obj, callback, timeout, 0.);
             ev_timer_start(main_loop, timer_obj);
@@ -289,8 +292,9 @@ static void input_done(void) {
 #ifdef __OpenBSD__
     struct passwd *pw;
 
-    if (!(pw = getpwuid(getuid())))
+    if (!(pw = getpwuid(getuid()))) {
         errx(1, "unknown uid %u.", getuid());
+    }
 
     if (auth_userokay(pw->pw_name, NULL, NULL, password) != 0) {
         DEBUG("successfully authenticated\n");
@@ -309,56 +313,27 @@ static void input_done(void) {
          * credentials like kerberos /tmp/krb5cc_pam_* files which may of been left behind if the
          * refresh of the credentials failed. */
         pam_setcred(pam_handle, PAM_REFRESH_CRED);
-        pam_end(pam_handle, PAM_SUCCESS);
+        pam_cleanup = true;
 
         ev_break(EV_DEFAULT, EVBREAK_ALL);
         return;
     }
 #endif
 
-    if (debug_mode)
+    if (debug_mode) {
         fprintf(stderr, "Authentication failure\n");
-
-    /* Get state of Caps and Num lock modifiers, to be displayed in
-     * STATE_AUTH_WRONG state */
-    xkb_mod_index_t idx, num_mods;
-    const char *mod_name;
-
-    num_mods = xkb_keymap_num_mods(xkb_keymap);
-
-    for (idx = 0; idx < num_mods; idx++) {
-        if (!xkb_state_mod_index_is_active(xkb_state, idx, XKB_STATE_MODS_EFFECTIVE))
-            continue;
-
-        mod_name = xkb_keymap_mod_get_name(xkb_keymap, idx);
-        if (mod_name == NULL)
-            continue;
-
-        /* Replace certain xkb names with nicer, human-readable ones. */
-        if (strcmp(mod_name, XKB_MOD_NAME_CAPS) == 0)
-            mod_name = "Caps Lock";
-        else if (strcmp(mod_name, XKB_MOD_NAME_ALT) == 0)
-            mod_name = "Alt";
-        else if (strcmp(mod_name, XKB_MOD_NAME_NUM) == 0)
-            mod_name = "Num Lock";
-        else if (strcmp(mod_name, XKB_MOD_NAME_LOGO) == 0)
-            mod_name = "Super";
-
-        char *tmp;
-        if (modifier_string == NULL) {
-            if (asprintf(&tmp, "%s", mod_name) != -1)
-                modifier_string = tmp;
-        } else if (asprintf(&tmp, "%s, %s", modifier_string, mod_name) != -1) {
-            free(modifier_string);
-            modifier_string = tmp;
-        }
     }
 
     auth_state = STATE_AUTH_WRONG;
-    failed_attempts += 1;
+    /* The unlock indicator displays the number of failed attempts,
+     * but caps the attempts to 999, so only increment up to 999. */
+    if (failed_attempts < 999) {
+        failed_attempts += 1;
+    }
     clear_input();
-    if (unlock_indicator)
+    if (unlock_indicator) {
         redraw_screen();
+    }
 
     /* Clear this state after 2 seconds (unless the user enters another
      * password during that time). */
@@ -382,11 +357,13 @@ static void redraw_timeout(EV_P_ ev_timer *w, int revents) {
 }
 
 static bool skip_without_validation(void) {
-    if (input_position != 0)
+    if (input_position != 0) {
         return false;
+    }
 
-    if (skip_repeated_empty_password || ignore_empty_password)
+    if (skip_repeated_empty_password || ignore_empty_password) {
         return true;
+    }
 
     return false;
 }
@@ -418,7 +395,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
                 return;
             case XKB_COMPOSE_COMPOSED:
                 /* xkb_compose_state_get_utf8 doesn't include the terminating byte in the return value
-             * as xkb_keysym_to_utf8 does. Adding one makes the variable n consistent. */
+                 * as xkb_keysym_to_utf8 does. Adding one makes the variable n consistent. */
                 n = xkb_compose_state_get_utf8(xkb_compose_state, buffer, sizeof(buffer)) + 1;
                 ksym = xkb_compose_state_get_one_sym(xkb_compose_state);
                 composed = true;
@@ -439,8 +416,9 @@ static void handle_key_press(xcb_key_press_event_t *event) {
         case XKB_KEY_Return:
         case XKB_KEY_KP_Enter:
         case XKB_KEY_XF86ScreenSaver:
-            if ((ksym == XKB_KEY_j || ksym == XKB_KEY_m) && !ctrl)
+            if ((ksym == XKB_KEY_j || ksym == XKB_KEY_m) && !ctrl) {
                 break;
+            }
 
             if (auth_state == STATE_AUTH_WRONG) {
                 retry_verification = true;
@@ -472,8 +450,9 @@ static void handle_key_press(xcb_key_press_event_t *event) {
                 DEBUG("C-u pressed\n");
                 clear_input();
                 /* Also hide the unlock indicator */
-                if (unlock_indicator)
+                if (unlock_indicator) {
                     clear_indicator();
+                }
                 return;
             }
             break;
@@ -488,8 +467,9 @@ static void handle_key_press(xcb_key_press_event_t *event) {
 
         case XKB_KEY_h:
         case XKB_KEY_BackSpace:
-            if (ksym == XKB_KEY_h && !ctrl)
+            if (ksym == XKB_KEY_h && !ctrl) {
                 break;
+            }
 
             if (input_position == 0) {
                 START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
@@ -511,8 +491,9 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             return;
     }
 
-    if ((input_position + 8) >= (int)sizeof(password))
+    if ((input_position + 8) >= (int)sizeof(password)) {
         return;
+    }
 
 #if 0
     /* FIXME: handle all of these? */
@@ -525,8 +506,9 @@ static void handle_key_press(xcb_key_press_event_t *event) {
     printf("xcb_is_modifier_key = %d\n", xcb_is_modifier_key(sym));
 #endif
 
-    if (n < 2)
+    if (n < 2) {
         return;
+    }
 
     /* store it in the password array as UTF-8 */
     memcpy(password + input_position, buffer, n - 1);
@@ -587,8 +569,9 @@ static void process_xkb_event(xcb_generic_event_t *gevent) {
 
     DEBUG("process_xkb_event for device %d\n", event->any.deviceID);
 
-    if (event->any.deviceID != xkb_x11_get_core_keyboard_device_id(conn))
+    if (event->any.deviceID != xkb_x11_get_core_keyboard_device_id(conn)) {
         return;
+    }
 
     /*
      * XkbNewKkdNotify and XkbMapNotify together capture all sorts of keymap
@@ -597,8 +580,9 @@ static void process_xkb_event(xcb_generic_event_t *gevent) {
      */
     switch (event->any.xkbType) {
         case XCB_XKB_NEW_KEYBOARD_NOTIFY:
-            if (event->new_keyboard_notify.changed & XCB_XKB_NKN_DETAIL_KEYCODES)
+            if (event->new_keyboard_notify.changed & XCB_XKB_NKN_DETAIL_KEYCODES) {
                 (void)load_keymap();
+            }
             break;
 
         case XCB_XKB_MAP_NOTIFY:
@@ -623,12 +607,13 @@ static void process_xkb_event(xcb_generic_event_t *gevent) {
  * and also redraw the image, if any.
  *
  */
-void handle_screen_resize(void) {
+static void handle_screen_resize(void) {
     xcb_get_geometry_cookie_t geomc;
     xcb_get_geometry_reply_t *geom;
     geomc = xcb_get_geometry(conn, screen->root);
-    if ((geom = xcb_get_geometry_reply(conn, geomc, 0)) == NULL)
+    if ((geom = xcb_get_geometry_reply(conn, geomc, 0)) == NULL) {
         return;
+    }
 
     if (last_resolution[0] == geom->width &&
         last_resolution[1] == geom->height) {
@@ -656,8 +641,9 @@ static ssize_t read_raw_image_native(uint32_t *dest, FILE *src, size_t width, si
     for (size_t y = 0; y < height; y++) {
         size_t n = fread(&dest[y * pixstride], 1, width * 4, src);
         count += n;
-        if (n < (size_t)(width * 4))
+        if (n < (size_t)(width * 4)) {
             break;
+        }
     }
 
     return count;
@@ -673,15 +659,17 @@ struct raw_pixel_format {
 static ssize_t read_raw_image_fmt(uint32_t *dest, FILE *src, size_t width, size_t height, int pixstride,
                                   struct raw_pixel_format fmt) {
     unsigned char *buf = malloc(width * fmt.bpp);
-    if (buf == NULL)
+    if (buf == NULL) {
         return -1;
+    }
 
     ssize_t count = 0;
     for (size_t y = 0; y < height; y++) {
         size_t n = fread(buf, 1, width * fmt.bpp, src);
         count += n;
-        if (n < (size_t)(width * fmt.bpp))
+        if (n < (size_t)(width * fmt.bpp)) {
             break;
+        }
 
         for (size_t x = 0; x < width; ++x) {
             int idx = x * fmt.bpp;
@@ -752,18 +740,19 @@ static cairo_surface_t *read_raw_image(const char *image_path, const char *image
     } else {
         const struct raw_pixel_format *fmt = NULL;
 
-        if (strcmp(pixfmt, "rgb") == 0)
+        if (strcmp(pixfmt, "rgb") == 0) {
             fmt = &raw_fmt_rgb;
-        else if (strcmp(pixfmt, "rgbx") == 0)
+        } else if (strcmp(pixfmt, "rgbx") == 0) {
             fmt = &raw_fmt_rgbx;
-        else if (strcmp(pixfmt, "xrgb") == 0)
+        } else if (strcmp(pixfmt, "xrgb") == 0) {
             fmt = &raw_fmt_xrgb;
-        else if (strcmp(pixfmt, "bgr") == 0)
+        } else if (strcmp(pixfmt, "bgr") == 0) {
             fmt = &raw_fmt_bgr;
-        else if (strcmp(pixfmt, "bgrx") == 0)
+        } else if (strcmp(pixfmt, "bgrx") == 0) {
             fmt = &raw_fmt_bgrx;
-        else if (strcmp(pixfmt, "xbgr") == 0)
+        } else if (strcmp(pixfmt, "xbgr") == 0) {
             fmt = &raw_fmt_xbgr;
+        }
 
         if (fmt == NULL) {
             fprintf(stderr, "Unknown raw pixel format: %s\n", pixfmt);
@@ -834,8 +823,9 @@ static bool verify_png_image(const char *image_path) {
  */
 static int conv_callback(int num_msg, const struct pam_message **msg,
                          struct pam_response **resp, void *appdata_ptr) {
-    if (num_msg == 0)
+    if (num_msg == 0) {
         return 1;
+    }
 
     /* PAM expects an array of responses, one for each message */
     if ((*resp = calloc(num_msg, sizeof(struct pam_response))) == NULL) {
@@ -845,8 +835,9 @@ static int conv_callback(int num_msg, const struct pam_message **msg,
 
     for (int c = 0; c < num_msg; c++) {
         if (msg[c]->msg_style != PAM_PROMPT_ECHO_OFF &&
-            msg[c]->msg_style != PAM_PROMPT_ECHO_ON)
+            msg[c]->msg_style != PAM_PROMPT_ECHO_ON) {
             continue;
+        }
 
         /* return code is currently not used but should be set to zero */
         resp[c]->resp_retcode = 0;
@@ -901,15 +892,17 @@ static void maybe_close_sleep_lock_fd(void) {
 static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
     xcb_generic_event_t *event;
 
-    if (xcb_connection_has_error(conn))
+    if (xcb_connection_has_error(conn)) {
         errx(EXIT_FAILURE, "X11 connection broke, did your server terminate?");
+    }
 
     while ((event = xcb_poll_for_event(conn)) != NULL) {
         if (event->response_type == 0) {
             xcb_generic_error_t *error = (xcb_generic_error_t *)event;
-            if (debug_mode)
+            if (debug_mode) {
                 fprintf(stderr, "X11 Error received! sequence 0x%x, error_code = %d\n",
                         error->sequence, error->error_code);
+            }
             free(event);
             continue;
         }
@@ -934,8 +927,9 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                     dont_fork = true;
 
                     /* In the parent process, we exit */
-                    if (fork() != 0)
+                    if (fork() != 0) {
                         exit(0);
+                    }
 
                     ev_loop_fork(EV_DEFAULT);
                 }
@@ -948,6 +942,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
             default:
                 if (type == xkb_base_event) {
                     process_xkb_event(event);
+                    redraw_screen();
                 }
                 if (randr_base > -1 &&
                     type == randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY) {
@@ -971,8 +966,9 @@ static void raise_loop(xcb_window_t window) {
     xcb_generic_event_t *event;
     int screens;
 
-    if (xcb_connection_has_error((conn = xcb_connect(NULL, &screens))) > 0)
+    if (xcb_connection_has_error((conn = xcb_connect(NULL, &screens))) > 0) {
         errx(EXIT_FAILURE, "Cannot open display");
+    }
 
     /* We need to know about the window being obscured or getting destroyed. */
     xcb_change_window_attributes(conn, window, XCB_CW_EVENT_MASK,
@@ -999,13 +995,15 @@ static void raise_loop(xcb_window_t window) {
                 break;
             case XCB_UNMAP_NOTIFY:
                 DEBUG("UnmapNotify for 0x%08x\n", (((xcb_unmap_notify_event_t *)event)->window));
-                if (((xcb_unmap_notify_event_t *)event)->window == window)
+                if (((xcb_unmap_notify_event_t *)event)->window == window) {
                     exit(EXIT_SUCCESS);
+                }
                 break;
             case XCB_DESTROY_NOTIFY:
                 DEBUG("DestroyNotify for 0x%08x\n", (((xcb_destroy_notify_event_t *)event)->window));
-                if (((xcb_destroy_notify_event_t *)event)->window == window)
+                if (((xcb_destroy_notify_event_t *)event)->window == window) {
                     exit(EXIT_SUCCESS);
+                }
                 break;
             default:
                 DEBUG("Unhandled event type %d\n", type);
@@ -1015,19 +1013,16 @@ static void raise_loop(xcb_window_t window) {
     }
 }
 
-int verify_hex(char *arg, char *colortype, char *varname) {
+/* Parses a color given as rrggbb (optionally prefixed with #) into dest. */
+static void verify_hex(char *arg, char *dest, const char *varname) {
     /* Skip # if present */
     if (arg[0] == '#') {
-        arg++;  
+        arg++;
     }
-        
-    if (strlen(arg) != 6 || sscanf(arg, "%06[0-9a-fA-F]", colortype) != 1) {
-        errx(EXIT_FAILURE, "%s is invalid, it must be given in 3-byte hexadecimal format: rrggbb\n", varname);
 
-        return 0;
+    if (strlen(arg) != 6 || sscanf(arg, "%06[0-9a-fA-F]", dest) != 1) {
+        errx(EXIT_FAILURE, "%s is invalid, it must be given in 3-byte hexadecimal format: rrggbb", varname);
     }
-        
-    return 1;
 }
 
 int main(int argc, char *argv[]) {
@@ -1062,16 +1057,12 @@ int main(int argc, char *argv[]) {
         {"wrong-color", required_argument, NULL, 'w'},
         {"idle-color", required_argument, NULL, 'l'},
         {"24", no_argument, NULL, '4'},
-        {NULL, no_argument, NULL, 0}
-    };
+        {"show-keyboard-layout", no_argument, NULL, 'k'},
+        {NULL, no_argument, NULL, 0}};
 
-    if ((pw = getpwuid(getuid())) == NULL)
-        err(EXIT_FAILURE, "getpwuid() failed");
-    if ((username = pw->pw_name) == NULL)
-        errx(EXIT_FAILURE, "pw->pw_name is NULL.");
-
-    char *optstring = "hvnbdc:o:w:l:p:ui:teI:f";
-    while ((o = getopt_long(argc, argv, optstring, longopts, &optind)) != -1) {
+    int code = EXIT_FAILURE;
+    char *optstring = "hvnbdc:o:w:l:p:ui:teI:fk";
+    while ((o = getopt_long(argc, argv, optstring, longopts, &longoptind)) != -1) {
         switch (o) {
             case 'v':
                 errx(EXIT_SUCCESS, "version " I3LOCK_VERSION " © 2010 Michael Stapelberg");
@@ -1088,17 +1079,17 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Inactivity timeout only makes sense with DPMS, which was removed. Please see the manpage i3lock(1).\n");
                 break;
             }
-            case 'c': 
-                verify_hex(optarg,color, "color");
+            case 'c':
+                verify_hex(optarg, color, "color");
                 break;
             case 'o':
-                verify_hex(optarg,verifycolor, "verifycolor");
+                verify_hex(optarg, verifycolor, "verifycolor");
                 break;
             case 'w':
-                verify_hex(optarg,wrongcolor, "wrongcolor");
+                verify_hex(optarg, wrongcolor, "wrongcolor");
                 break;
             case 'l':
-                verify_hex(optarg,idlecolor, "idlecolor");
+                verify_hex(optarg, idlecolor, "idlecolor");
                 break;
             case '4':
                 use24hour = true;
@@ -1125,19 +1116,35 @@ int main(int argc, char *argv[]) {
                 ignore_empty_password = true;
                 break;
             case 0:
-                if (strcmp(longopts[longoptind].name, "debug") == 0)
+                if (strcmp(longopts[longoptind].name, "debug") == 0) {
                     debug_mode = true;
-                else if (strcmp(longopts[longoptind].name, "raw") == 0)
+                } else if (strcmp(longopts[longoptind].name, "raw") == 0) {
                     image_raw_format = strdup(optarg);
+                }
                 break;
             case 'f':
                 show_failed_attempts = true;
                 break;
+            case 'k':
+                show_keyboard_layout = true;
+                break;
+            case 'h':
+                code = EXIT_SUCCESS;
+                /* fallthrough */
             default:
-                errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-o color] [-w color] [-l color] [-u] [-p win|default]"
-                " [-i image.png] [-t] [-e] [-I timeout] [-f] [--24]"
-                );
+                errx(code, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-o color] [-w color] [-l color] [-u] [-p win|default]"
+                           " [-i image.png] [-t] [-e] [-I timeout] [-f] [-k] [--24]");
         }
+    }
+
+    if ((pw = getpwuid(getuid())) == NULL) {
+        err(EXIT_FAILURE, "getpwuid() failed");
+    }
+    if ((username = pw->pw_name) == NULL) {
+        errx(EXIT_FAILURE, "pw->pw_name is NULL.");
+    }
+    if (getenv("WAYLAND_DISPLAY") != NULL) {
+        errx(EXIT_FAILURE, "i3lock is a program for X11 and does not work on Wayland. Try https://github.com/swaywm/swaylock instead");
     }
 
     /* We need (relatively) random numbers for highlighting a random part of
@@ -1146,11 +1153,13 @@ int main(int argc, char *argv[]) {
 
 #ifndef __OpenBSD__
     /* Initialize PAM */
-    if ((ret = pam_start("i3lock", username, &conv, &pam_handle)) != PAM_SUCCESS)
+    if ((ret = pam_start("i3lock", username, &conv, &pam_handle)) != PAM_SUCCESS) {
         errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
+    }
 
-    if ((ret = pam_set_item(pam_handle, PAM_TTY, getenv("DISPLAY"))) != PAM_SUCCESS)
+    if ((ret = pam_set_item(pam_handle, PAM_TTY, getenv("DISPLAY"))) != PAM_SUCCESS) {
         errx(EXIT_FAILURE, "PAM: %s", pam_strerror(pam_handle, ret));
+    }
 #endif
 
 /* Using mlock() as non-super-user seems only possible in Linux.
@@ -1162,15 +1171,17 @@ int main(int argc, char *argv[]) {
     /* Lock the area where we store the password in memory, we don’t want it to
      * be swapped to disk. Since Linux 2.6.9, this does not require any
      * privileges, just enough bytes in the RLIMIT_MEMLOCK limit. */
-    if (mlock(password, sizeof(password)) != 0)
+    if (mlock(password, sizeof(password)) != 0) {
         err(EXIT_FAILURE, "Could not lock page in memory, check RLIMIT_MEMLOCK");
+    }
 #endif
 
     /* Double checking that connection is good and operatable with xcb */
     int screennr;
     if ((conn = xcb_connect(NULL, &screennr)) == NULL ||
-        xcb_connection_has_error(conn))
+        xcb_connection_has_error(conn)) {
         errx(EXIT_FAILURE, "Could not connect to X11, maybe you need to set DISPLAY?");
+    }
 
     if (xkb_x11_setup_xkb_extension(conn,
                                     XKB_X11_MIN_MAJOR_XKB_VERSION,
@@ -1179,8 +1190,9 @@ int main(int argc, char *argv[]) {
                                     NULL,
                                     NULL,
                                     &xkb_base_event,
-                                    &xkb_base_error) != 1)
+                                    &xkb_base_error) != 1) {
         errx(EXIT_FAILURE, "Could not setup XKB extension.");
+    }
 
     static const xcb_xkb_map_part_t required_map_parts =
         (XCB_XKB_MAP_PART_KEY_TYPES |
@@ -1207,17 +1219,21 @@ int main(int argc, char *argv[]) {
         0);
 
     /* When we cannot initially load the keymap, we better exit */
-    if (!load_keymap())
+    if (!load_keymap()) {
         errx(EXIT_FAILURE, "Could not load keymap");
+    }
 
     const char *locale = getenv("LC_ALL");
-    if (!locale || !*locale)
-        locale = getenv("LC_CTYPE");
-    if (!locale || !*locale)
-        locale = getenv("LANG");
     if (!locale || !*locale) {
-        if (debug_mode)
+        locale = getenv("LC_CTYPE");
+    }
+    if (!locale || !*locale) {
+        locale = getenv("LANG");
+    }
+    if (!locale || !*locale) {
+        if (debug_mode) {
             fprintf(stderr, "Can't detect your locale, fallback to C\n");
+        }
         locale = "C";
     }
 
@@ -1255,7 +1271,8 @@ int main(int argc, char *argv[]) {
     free(image_raw_format);
 
     /* Pixmap on which the image is rendered to (if any) */
-    xcb_pixmap_t bg_pixmap = draw_image(last_resolution);
+    xcb_pixmap_t bg_pixmap = create_bg_pixmap(conn, screen, last_resolution, color);
+    draw_image(bg_pixmap, last_resolution);
 
     xcb_window_t stolen_focus = find_focused_window(conn, screen->root);
 
@@ -1305,16 +1322,17 @@ int main(int argc, char *argv[]) {
 
     /* Initialize the libev event loop. */
     main_loop = EV_DEFAULT;
-    if (main_loop == NULL)
+    if (main_loop == NULL) {
         errx(EXIT_FAILURE, "Could not initialize libev. Bad LIBEV_FLAGS?");
+    }
 
     /* Explicitly call the screen redraw in case "locking…" message was displayed */
     auth_state = STATE_AUTH_IDLE;
     redraw_screen();
 
-    struct ev_io *xcb_watcher = calloc(sizeof(struct ev_io), 1);
-    struct ev_check *xcb_check = calloc(sizeof(struct ev_check), 1);
-    struct ev_prepare *xcb_prepare = calloc(sizeof(struct ev_prepare), 1);
+    struct ev_io *xcb_watcher = calloc(1, sizeof(struct ev_io));
+    struct ev_check *xcb_check = calloc(1, sizeof(struct ev_check));
+    struct ev_prepare *xcb_prepare = calloc(1, sizeof(struct ev_prepare));
 
     ev_io_init(xcb_watcher, xcb_got_event, xcb_get_file_descriptor(conn), EV_READ);
     ev_io_start(main_loop, xcb_watcher);
@@ -1333,6 +1351,12 @@ int main(int argc, char *argv[]) {
     start_time_redraw_tick(main_loop);
 
     ev_loop(main_loop, 0);
+
+#ifndef __OpenBSD__
+    if (pam_cleanup) {
+        pam_end(pam_handle, PAM_SUCCESS);
+    }
+#endif
 
     if (stolen_focus == XCB_NONE) {
         return 0;

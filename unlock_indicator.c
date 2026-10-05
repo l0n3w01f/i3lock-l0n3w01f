@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <xcb/xcb.h>
+#include <xkbcommon/xkbcommon.h>
 #include <ev.h>
 #include <cairo.h>
 #include <cairo/cairo-xcb.h>
@@ -38,9 +39,8 @@ static struct ev_periodic *time_redraw_tick;
 extern bool debug_mode;
 
 /* The current position in the input buffer. Useful to determine if any
- * characters of the password have already been entered or not. 
- */
-int input_position;
+ * characters of the password have already been entered or not. */
+extern int input_position;
 
 /* The lock window. */
 extern xcb_window_t win;
@@ -53,6 +53,8 @@ extern bool unlock_indicator;
 
 /* List of pressed modifiers, or NULL if none are pressed. */
 extern char *modifier_string;
+/* Name of the current keyboard layout or NULL if not initialized. */
+char *layout_string = NULL;
 
 /* A Cairo surface containing the specified image (-i), if any. */
 extern cairo_surface_t *img;
@@ -77,9 +79,13 @@ extern bool use24hour;
 
 /* Whether the failed attempts should be displayed. */
 extern bool show_failed_attempts;
-
+/* Whether keyboard layout should be displayed. */
+extern bool show_keyboard_layout;
 /* Number of failed unlock attempts. */
 extern int failed_attempts;
+
+extern struct xkb_keymap *xkb_keymap;
+extern struct xkb_state *xkb_state;
 
 /*******************************************************************************
  * Variables defined in xcb.c.
@@ -101,22 +107,148 @@ static xcb_visualtype_t *vistype;
 unlock_state_t unlock_state;
 auth_state_t auth_state;
 
+static void string_append(char **string_ptr, const char *appended) {
+    char *tmp = NULL;
+    if (*string_ptr == NULL) {
+        if (asprintf(&tmp, "%s", appended) != -1) {
+            *string_ptr = tmp;
+        }
+    } else if (asprintf(&tmp, "%s, %s", *string_ptr, appended) != -1) {
+        free(*string_ptr);
+        *string_ptr = tmp;
+    }
+}
+
+/* Draws text centered in the unlock indicator using the current source color. */
+static void display_button_text(cairo_t *ctx, const char *text, double y_offset) {
+    cairo_text_extents_t extents;
+    double x, y;
+
+    cairo_text_extents(ctx, text, &extents);
+    x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
+    y = BUTTON_CENTER - ((extents.height / 2) + extents.y_bearing) + y_offset;
+
+    cairo_move_to(ctx, x, y);
+    cairo_show_text(ctx, text);
+    cairo_close_path(ctx);
+}
+
+/* Sets the color based on argument (color/background, verify, wrong, idle)
+ * and type (line, background and fill). Type defines alpha value and tint.
+ */
+static void set_color(cairo_t *cr, const char *colorarg, char colortype) {
+    char strgroups[3][3] = {{colorarg[0], colorarg[1], '\0'},
+                            {colorarg[2], colorarg[3], '\0'},
+                            {colorarg[4], colorarg[5], '\0'}};
+    uint32_t rgb16[3] = {(strtol(strgroups[0], NULL, 16)),
+                         (strtol(strgroups[1], NULL, 16)),
+                         (strtol(strgroups[2], NULL, 16))};
+
+    switch (colortype) {
+        case 'b': /* Background */
+            cairo_set_source_rgb(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0);
+            break;
+        case 'l': /* Line and text */
+            cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.8);
+            break;
+        case 'f': /* Fill */
+            /* Use a lighter tint of the user defined color for circle fill */
+            for (int i = 0; i < 3; i++) {
+                rgb16[i] = ((255 - rgb16[i]) * .5) + rgb16[i];
+            }
+            cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.2);
+            break;
+    }
+}
+
+/* Use the appropriate color for the different PAM states
+ * (currently verifying, wrong password, or idle)
+ */
+static void set_auth_color(cairo_t *cr, char colortype) {
+    switch (auth_state) {
+        case STATE_AUTH_VERIFY:
+            set_color(cr, verifycolor, colortype);
+            break;
+        case STATE_AUTH_LOCK:
+            set_color(cr, idlecolor, colortype);
+            break;
+        case STATE_AUTH_WRONG:
+        case STATE_I3LOCK_LOCK_FAILED:
+            set_color(cr, wrongcolor, colortype);
+            break;
+        case STATE_AUTH_IDLE:
+            if (unlock_state == STATE_BACKSPACE_ACTIVE) {
+                set_color(cr, wrongcolor, colortype);
+            } else {
+                set_color(cr, idlecolor, colortype);
+            }
+            break;
+    }
+}
+
+static void update_layout_string() {
+    if (layout_string) {
+        free(layout_string);
+        layout_string = NULL;
+    }
+    xkb_layout_index_t num_layouts = xkb_keymap_num_layouts(xkb_keymap);
+    for (xkb_layout_index_t i = 0; i < num_layouts; ++i) {
+        if (xkb_state_layout_index_is_active(xkb_state, i, XKB_STATE_LAYOUT_EFFECTIVE)) {
+            const char *name = xkb_keymap_layout_get_name(xkb_keymap, i);
+            if (name) {
+                string_append(&layout_string, name);
+            }
+        }
+    }
+}
+
+/* check_modifier_keys describes the currently active modifiers (Caps Lock, Alt,
+   Num Lock or Super) in the modifier_string variable. */
+static void check_modifier_keys(void) {
+    xkb_mod_index_t idx, num_mods;
+    const char *mod_name;
+
+    num_mods = xkb_keymap_num_mods(xkb_keymap);
+
+    for (idx = 0; idx < num_mods; idx++) {
+        if (!xkb_state_mod_index_is_active(xkb_state, idx, XKB_STATE_MODS_EFFECTIVE)) {
+            continue;
+        }
+
+        mod_name = xkb_keymap_mod_get_name(xkb_keymap, idx);
+        if (mod_name == NULL) {
+            continue;
+        }
+
+        /* Replace certain xkb names with nicer, human-readable ones. */
+        if (strcmp(mod_name, XKB_MOD_NAME_CAPS) == 0) {
+            mod_name = "Caps Lock";
+        } else if (strcmp(mod_name, XKB_MOD_NAME_NUM) == 0) {
+            mod_name = "Num Lock";
+        } else {
+            /* Show only Caps Lock and Num Lock, other modifiers (e.g. Shift)
+             * leak state about the password. */
+            continue;
+        }
+        string_append(&modifier_string, mod_name);
+    }
+}
+
 /*
  * Draws global image with fill color onto a pixmap with the given
  * resolution and returns it.
  */
-xcb_pixmap_t draw_image(uint32_t *resolution) {
-    xcb_pixmap_t bg_pixmap = XCB_NONE;
+void draw_image(xcb_pixmap_t bg_pixmap, uint32_t *resolution) {
     const double scaling_factor = get_dpi_value() / 96.0;
     int button_diameter_physical = ceil(scaling_factor * BUTTON_DIAMETER);
     DEBUG("scaling_factor is %.f, physical diameter is %d px\n",
           scaling_factor, button_diameter_physical);
 
-    if (!vistype)
+    if (!vistype) {
         vistype = get_root_visual_type(screen);
-    bg_pixmap = create_bg_pixmap(conn, screen, resolution, color);
-    /* 
-     * Initialize cairo: Create one in-memory surface to render the unlock
+    }
+
+    /* Initialize cairo: Create one in-memory surface to render the unlock
      * indicator on, create one XCB surface to actually draw (one or more,
      * depending on the amount of screens) unlock indicators on. 
      */
@@ -126,45 +258,12 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
     cairo_surface_t *xcb_output = cairo_xcb_surface_create(conn, bg_pixmap, vistype, resolution[0], resolution[1]);
     cairo_t *xcb_ctx = cairo_create(xcb_output);
 
-    /* Creates color array from command line arguments */
-    uint32_t * color_array(char* colorarg) {
-        uint32_t *rgb16 = malloc(sizeof(uint32_t)*3);
-
-        char strgroups[3][3] = {{colorarg[0], colorarg[1], '\0'},
-                                {colorarg[2], colorarg[3], '\0'},
-                                {colorarg[4], colorarg[5], '\0'}};
-
-        for (int i=0; i < 3; i++) {
-            rgb16[i] = strtol(strgroups[i], NULL, 16);
-        }
-
-        return rgb16;
-    }
-
-    /* Sets the color based on argument (color/background, verify, wrong, idle)
-     * and type (line, background and fill). Type defines alpha value and tint.
-     * Utilizes color_array() and frees after use.
-     */
-    void set_color(cairo_t *cr, char *colorarg, char colortype) {
-        uint32_t *rgb16 = color_array(colorarg);
-
-        switch(colortype) {
-            case 'b': /* Background */
-                cairo_set_source_rgb(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0);
-                break;
-            case 'l': /* Line and text */
-                cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.8);
-                break;
-            case 'f': /* Fill */
-                /* Use a lighter tint of the user defined color for circle fill */
-                for (int i=0; i < 3; i++) {
-                    rgb16[i] = ((255 - rgb16[i]) * .5) + rgb16[i];
-                }
-                cairo_set_source_rgba(cr, rgb16[0] / 255.0, rgb16[1] / 255.0, rgb16[2] / 255.0, 0.2);
-                break;
-        }
-        free(rgb16);
-    }
+    /* After the first iteration, the pixmap will still contain the previous
+     * contents. Explicitly clear the entire pixmap with the background color
+     * first to get back into a defined state: */
+    set_color(xcb_ctx, color, 'b');
+    cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
+    cairo_fill(xcb_ctx);
 
     if (img) {
         if (!tile) {
@@ -180,10 +279,6 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
             cairo_fill(xcb_ctx);
             cairo_pattern_destroy(pattern);
         }
-    } else {
-        set_color(xcb_ctx,color,'b'); /* If not image, use color to fill background */
-        cairo_rectangle(xcb_ctx, 0, 0, resolution[0], resolution[1]);
-        cairo_fill(xcb_ctx);
     }
 
     if (unlock_indicator) {
@@ -197,83 +292,35 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
                   0 /* start */,
                   2 * M_PI /* end */);
 
-        /* Use the appropriate color for the different PAM states
-         * (currently verifying, wrong password, or idle) 
-         */
-
-        void set_auth_color(char colortype) {
-            switch (auth_state) {
-                case STATE_AUTH_VERIFY:
-                    set_color(ctx,verifycolor,colortype);
-                    break;
-                case STATE_AUTH_LOCK:
-                    set_color(ctx,idlecolor,colortype);
-                    break;
-                case STATE_AUTH_WRONG:
-                    set_color(ctx,wrongcolor,colortype);
-                    break;
-                case STATE_I3LOCK_LOCK_FAILED:
-                    set_color(ctx,wrongcolor,colortype);
-                    break;
-                case STATE_AUTH_IDLE:
-                    if (unlock_state == STATE_BACKSPACE_ACTIVE) {
-                        set_color(ctx,wrongcolor,colortype);
-                    }
-                    else {
-                        set_color(ctx,idlecolor,colortype);  
-                    }
-                    break;
-            }
-        }
-
-        set_auth_color('f');
+        set_auth_color(ctx, 'f');
         cairo_fill_preserve(ctx);
 
         /* Circle border */
-        set_auth_color('l');
+        set_auth_color(ctx, 'l');
         cairo_stroke(ctx);
 
         /* Display (centered) Time */
-        char *timetext = malloc(6);
+        char timetext[32] = "";
 
         time_t curtime = time(NULL);
         struct tm *tm = localtime(&curtime);
-        if (use24hour)
-            strftime(timetext, 100, TIME_FORMAT_24, tm);
-        else
-            strftime(timetext, 100, TIME_FORMAT_12, tm);
+        if (tm != NULL) {
+            strftime(timetext, sizeof(timetext), use24hour ? TIME_FORMAT_24 : TIME_FORMAT_12, tm);
+        }
 
         /* Text */
-        set_auth_color('l');
+        set_auth_color(ctx, 'l');
         cairo_set_font_size(ctx, 32.0);
 
-        cairo_text_extents_t time_extents;
-        double time_x, time_y;
-        //cairo_select_font_face(ctx, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        display_button_text(ctx, timetext, 0.);
 
-        cairo_text_extents(ctx, timetext, &time_extents);
-        time_x = BUTTON_CENTER - ((time_extents.width / 2) + time_extents.x_bearing);
-        time_y = BUTTON_CENTER - ((time_extents.height / 2) + time_extents.y_bearing);
-
-        cairo_move_to(ctx, time_x, time_y);
-        cairo_show_text(ctx, timetext);
-        cairo_close_path(ctx);
-
-        free(timetext);
-
-        if (auth_state == STATE_AUTH_WRONG && (modifier_string != NULL)) {
-            cairo_text_extents_t extents;
-            double x, y;
-
+        if (modifier_string != NULL) {
             cairo_set_font_size(ctx, 14.0);
-
-            cairo_text_extents(ctx, modifier_string, &extents);
-            x = BUTTON_CENTER - ((extents.width / 2) + extents.x_bearing);
-            y = BUTTON_CENTER - ((extents.height / 2) + extents.y_bearing) + 28.0;
-
-            cairo_move_to(ctx, x, y);
-            cairo_show_text(ctx, modifier_string);
-            cairo_close_path(ctx);
+            display_button_text(ctx, modifier_string, 28.);
+        }
+        if (show_keyboard_layout && layout_string != NULL) {
+            cairo_set_font_size(ctx, 14.0);
+            display_button_text(ctx, layout_string, -28.);
         }
 
         /* After the user pressed any valid key or the backspace key, we
@@ -300,7 +347,7 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
             cairo_set_line_width(ctx, 10);
 
             /* Change color of separators based on backspace/active keypress */
-            set_auth_color('l');
+            set_auth_color(ctx, 'l');
 
             /* Separator 1 */
             cairo_arc(ctx,
@@ -346,25 +393,52 @@ xcb_pixmap_t draw_image(uint32_t *resolution) {
     cairo_surface_destroy(output);
     cairo_destroy(ctx);
     cairo_destroy(xcb_ctx);
-    return bg_pixmap;
+}
+
+static xcb_pixmap_t bg_pixmap = XCB_NONE;
+
+/*
+ * Releases the current background pixmap so that the next redraw_screen() call
+ * will allocate a new one with the updated resolution.
+ *
+ */
+void free_bg_pixmap(void) {
+    xcb_free_pixmap(conn, bg_pixmap);
+    bg_pixmap = XCB_NONE;
 }
 
 /* Calls draw_image on a new pixmap and swaps that with the current pixmap */
 void redraw_screen(void) {
     DEBUG("redraw_screen(unlock_state = %d, auth_state = %d)\n", unlock_state, auth_state);
-    xcb_pixmap_t bg_pixmap = draw_image(last_resolution);
+
+    if (modifier_string) {
+        free(modifier_string);
+        modifier_string = NULL;
+    }
+    check_modifier_keys();
+    update_layout_string();
+
+    if (bg_pixmap == XCB_NONE) {
+        DEBUG("allocating pixmap for %d x %d px\n", last_resolution[0], last_resolution[1]);
+        bg_pixmap = create_bg_pixmap(conn, screen, last_resolution, color);
+    }
+
+    draw_image(bg_pixmap, last_resolution);
     xcb_change_window_attributes(conn, win, XCB_CW_BACK_PIXMAP, (uint32_t[1]){bg_pixmap});
     /* XXX: Possible optimization: Only update the area in the middle of the
      * screen instead of the whole screen. */
     xcb_clear_area(conn, 0, win, 0, 0, last_resolution[0], last_resolution[1]);
-    xcb_free_pixmap(conn, bg_pixmap);
     xcb_flush(conn);
 }
 
 /* Always show unlock indicator. */
 
 void clear_indicator(void) {
-    unlock_state = STATE_KEY_PRESSED;
+    if (input_position == 0) {
+        unlock_state = STATE_STARTED;
+    } else {
+        unlock_state = STATE_KEY_PRESSED;
+    }
     redraw_screen();
 }
 
@@ -381,8 +455,9 @@ void start_time_redraw_tick(struct ev_loop* main_loop) {
     } else {
         /* When there is no memory, we just don’t have a timeout. We cannot
         * exit() here, since that would effectively unlock the screen. */
-        if (!(time_redraw_tick = calloc(sizeof(struct ev_periodic), 1)))
-        return;
+        if (!(time_redraw_tick = calloc(1, sizeof(struct ev_periodic)))) {
+            return;
+        }
         ev_periodic_init(time_redraw_tick,time_redraw_cb, 1.0, 60., 0);
         ev_periodic_start(main_loop, time_redraw_tick);
     }

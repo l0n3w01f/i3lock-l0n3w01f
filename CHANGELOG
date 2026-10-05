@@ -1,3 +1,50 @@
+2025-10-31 i3lock 2.16
+
+ • fix crash when the user changes the XKB configuration
+ • when started on Wayland, display an error and usage
+ • switch to clang-format 15 (with InsertBraces)
+ • fix -Werror=calloc-transposed-args by swapping calloc args
+ • reword: remove "dynamic" TWM
+ • update meson setup command in README
+ • do not increase failed_attempts beyond 999
+ • i3lock.1 man page: fix acute accent
+ • declare a development shell in flake.nix
+ • fix in_dpi variable checking
+ • meson: use explicit_bzero if it is available
+
+2024-03-16 i3lock 2.15
+
+ • unlock indicator: display current keyboard layout when
+   user types password (with --show-keyboard-layout flag).
+
+2022-06-21 i3lock 2.14.1
+
+ • unlock indicator: display only caps lock and num lock,
+   not all modifiers like shift (which can leak information
+   about your password to bystanders)
+
+2022-05-28 i3lock 2.14
+
+ • Change default background color to #a3a3a3
+   See https://github.com/i3/i3lock/pull/300 for extensive
+   discussion and rationale for this change.
+ • Recommend using xss-lock to start i3lock in the README
+   and i3lock.1 man page. xss-lock is the best way to ensure
+   your screen truly is locked before your computer suspends.
+ • Display modifier key warning before unlocking, too,
+   not just on failed attempts like before.
+ • Switch build system from autotools to meson.
+
+2020-10-27 i3lock 2.13
+
+ • Throw error when trying to start on Wayland
+ • Use explicit_bzero() where available, not just on OpenBSD
+ • avoid pixmap allocations in the redraw path
+ • make --debug output go to stderr
+ • unlock_indicator.c: fix build failure against gcc-10
+ • fix: call pam_end in cleanup in main, not in event loop
+ • set _NET_WM_BYPASS_COMPOSITOR hint to avoid flickering
+
 2019-07-21 i3lock 2.12
 
  • remove stray \n from error messages
